@@ -1,3 +1,6 @@
+# Easy-DODI-Installer-for-Linux
+A standalone Linux CLI for extracting DODI repacks, with an interactive menu for content and destination selection.
+
 # Executável standalone
 
 O arquivo pronto é `dist/dodi` (aproximadamente 92 MB). Copie-o para a pasta do repack e execute `./dodi`. Também aceita `./dodi /caminho/Setup.exe`. Sem argumentos, usa somente a pasta atual ou a pasta do próprio executável, sem varrer discos.
