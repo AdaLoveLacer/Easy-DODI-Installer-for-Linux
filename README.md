@@ -22,7 +22,7 @@ The default CLI extracts the package's selected volumes without running the orig
 
 ## Compatibility
 
-Direct extraction is currently audited for the Resident Evil 2 package used during development. Other repacks may require their own extraction plan; use `--gui` for those. The local Resident Evil 2 test validated all three volumes by path and size and matched SHA-256 hashes for all 87 extracted files against the existing installation. See [the test plan](docs/PLAN_RE2.md) and [technical references](docs/REFERENCES.md).
+Direct extraction is currently audited for the Resident Evil 2 package used during development. Other repacks may require their own extraction plan; use `--gui` for those. The local Resident Evil 2 test validated all three volumes by path and size and matched SHA-256 hashes for all 87 extracted files against the existing installation. See [the test plan](docs/PLAN_RE2.md), [compatibility validation](docs/COMPATIBILITY.md), and [technical references](docs/REFERENCES.md).
 
 ## Build
 
