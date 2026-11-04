@@ -17,10 +17,17 @@ This document records the supported runtime boundary for the standalone CLI and 
 | CachyOS rolling, x86-64, glibc 2.44, Python 3.14 | Pass on host | Native tools inspected; full package flow was validated separately on this computer. |
 | Debian 13, `python:3.12-slim-trixie`, glibc 2.41 | Pass in Docker | Standalone launched, parsed package volumes, checked embedded content table, and printed the direct extraction plan. No extraction was started in this container test. |
 | Ubuntu 24.04, glibc 2.39 | Pass in Docker | Same `--plan` checks as Debian 13. No extraction was started in this container test. |
-| Debian 12, `python:3.11-slim-bookworm`, glibc 2.36 | Fail | Native tool startup reported missing `GLIBCXX_3.4.32` and `GLIBC_2.38`. |
+| Debian 12, `python:3.11-slim-bookworm`, glibc 2.36 | Fail | Initial probe reported missing `GLIBCXX_3.4.32` and `GLIBC_2.38`; the current launcher now detects and reports these before unpacking Wine. |
 | Debian 12 slim without Python | Fail as expected | Launcher reported that `python3` is missing. |
+| Debian 12, current standalone launcher | Rejected clearly | Native preflight identified missing `GLIBCXX_3.4.32` and `GLIBC_2.38` before unpacking the Wine runtime. |
+| Python 3.9 | Rejected clearly | Launcher requires Python 3.11 or newer and reports the detected version. |
+| Python missing | Rejected clearly | Shell launcher reports the missing `python3` command. |
+| Simulated ARM64 architecture | Rejected clearly | Shell launcher reports that the bundle requires x86-64. |
+| Executable SSD mount missing (`noexec`) | Rejected clearly | Launcher stops before preparing the runtime. |
+| SSD space below the calculated runtime requirement | Rejected clearly | Launcher reports required and available byte counts before preparing the runtime. |
+| Cached runtime with less than the initial preparation space | Pass | A second launch succeeded after the runtime was prepared and free space fell below the first-run threshold. |
 
-The Docker checks used temporary executable mounts for `/mnt/SSD` and `/mnt/Eita`. A first run with a `noexec` temporary mount failed when starting the unpacked native tool; using `exec` allowed the preflight to continue. The test destination was intentionally too small to extract the package, and the container runs did not perform a full extraction.
+The Docker checks used temporary executable mounts for `/mnt/SSD` and `/mnt/Eita`. A first run with a `noexec` temporary mount failed when starting the unpacked native tool; the standalone now detects this before preparing its runtime. The test destination was intentionally too small to extract the package, and the container runs did not perform a full extraction. The launcher computes the runtime space requirement from the bundled archives and adds a 512 MiB margin.
 
 ## Validation matrix
 

@@ -16,7 +16,7 @@ The menu asks which language to use, then offers the package options. You can al
 ./dodi /path/to/Setup.exe
 ```
 
-The standalone includes the extraction tools and Wine runtime. On first launch, it prepares the runtime under `/mnt/SSD/Tools/dodi-cli`; keep that folder. It requires Linux x86-64, Python 3, and standard system libraries. The runtime is bundled, but the program is not a static binary.
+The standalone includes the extraction tools and Wine runtime. On first launch, it prepares the runtime under `/mnt/SSD/Tools/dodi-cli`; keep that folder. It requires Linux x86-64, Python 3.11 or newer, and compatible system libraries. The launcher checks these requirements, the SSD mount, and available space before preparing the runtime. The runtime is bundled, but the program is not a static binary.
 
 The default CLI extracts the package's selected volumes without running the original graphical Setup. It validates extracted paths and file sizes after each volume, records progress for resuming, and publishes the final folder after validation. `--gui` opens the original Setup instead; `--scan` searches for packages only when requested.
 
