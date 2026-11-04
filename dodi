@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""Interactive Linux extractor for local DODI Inno + FreeArc packages."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+INNO = ROOT / "libexec" / "innoextract"
+UNARC = ROOT / "libexec" / "unarc"
+HELPER = ROOT / "libexec" / "unarc-helper.exe"
+DEFAULT_SCAN_ROOTS = [Path("/mnt/Eita/Torrent/Games")]
+DATA_MOUNTS = [Path("/mnt/Eita"), Path("/mnt/HD_ARQUIVOS"),
+               Path("/mnt/Exclusivo OBS"), Path("/mnt/fodase"), Path("/mnt/SSD")]
+PREFLIGHT_TMP = Path("/mnt/Eita/.work/dodi-installer/tmp")
+PREFERRED_WINE = ROOT / "libexec/wine-11.14-fitgirl-amd64/bin/wine"
+if not PREFERRED_WINE.is_file():
+    PREFERRED_WINE = Path("/mnt/Eita/Tools/fitgirl-wine/wine-11.14-fitgirl-amd64/bin/wine")
+
+
+class DodiError(RuntimeError):
+    pass
+
+
+LANG = "pt"
+
+
+def tr(pt: str, en: str) -> str:
+    return pt if LANG == "pt" else en
+
+
+def choose_language() -> None:
+    global LANG
+    print("\nDODI INSTALLER / INSTALADOR DODI")
+    print("1. Português\n2. English")
+    while True:
+        choice = input("Idioma / Language [1]: ").strip() or "1"
+        if choice in {"1", "2"}:
+            LANG = "pt" if choice == "1" else "en"
+            return
+        print("Escolha 1 ou 2 / Choose 1 or 2.")
+
+
+def find_casefold(folder: Path, name: str) -> Path | None:
+    try:
+        return next((p for p in folder.iterdir() if p.name.casefold() == name.casefold()), None)
+    except OSError:
+        return None
+
+
+def package_files(folder: Path) -> tuple[Path, list[Path], list[Path]] | None:
+    setup = find_casefold(folder, "setup.exe")
+    if not setup:
+        return None
+    try:
+        volumes = [p for p in folder.iterdir() if p.is_file() and p.suffix.casefold() == ".doi"]
+    except OSError:
+        return None
+    required = [p for p in volumes if re.fullmatch(r"data\d+\.doi", p.name, re.I)]
+    required.sort(key=lambda p: int(re.search(r"\d+", p.stem).group()))
+    optional = sorted((p for p in volumes if p not in required), key=lambda p: p.name.casefold())
+    if not required:
+        return None
+    return setup, required, optional
+
+
+def discover(root: Path) -> list[Path]:
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+    for parent, dirs, _files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "Windows"}]
+        folder = Path(parent)
+        if package_files(folder):
+            found.append(folder)
+            dirs[:] = []
+    return sorted(found, key=lambda p: str(p).casefold())
+
+
+def run_capture(command: list[str], *, env: dict[str, str] | None = None) -> str:
+    if not Path("/mnt/Eita").is_mount():
+        raise DodiError("o volume Eita não está montado; temporários de análise não serão gravados no disco do sistema")
+    PREFLIGHT_TMP.mkdir(parents=True, exist_ok=True)
+    actual_env = (env or os.environ).copy()
+    actual_env["TMPDIR"] = str(PREFLIGHT_TMP)
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=actual_env, check=False)
+    if result.returncode:
+        raise DodiError(f"comando terminou com código {result.returncode}: {' '.join(command)}\n{result.stdout[-4000:]}")
+    return result.stdout
+
+
+def list_archive(archive: Path) -> tuple[int, int, int, list[tuple[str, int]]]:
+    output = run_capture([str(UNARC), "l", "--noarcext", str(archive)])
+    match = re.search(r"([\d,]+) files?,\s*([\d,]+) bytes,\s*([\d,]+) compressed", output)
+    if not match:
+        raise DodiError(f"não consegui ler o resumo do arquivo FreeArc: {archive.name}")
+    count, unpacked, packed = (int(s.replace(",", "")) for s in match.groups())
+    entries: list[tuple[str, int]] = []
+    directories = 0
+    for line in output.splitlines():
+        row = re.match(r"^\d{4}-\d\d-\d\d\s+\d\d:\d\d:\d\d\s+(-dir-|[\d,]+)\s+(.+)$", line)
+        if row:
+            name = row.group(2).replace("\\", "/")
+            relative = PurePosixPath(name)
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                raise DodiError(f"caminho inseguro no volume {archive.name}: {name}")
+            if row.group(1) == "-dir-":
+                directories += 1
+            else:
+                entries.append((name, int(row.group(1).replace(",", ""))))
+    if len(entries) + directories != count:
+        raise DodiError(f"listagem incompleta em {archive.name}: resumo informa {count} entradas, foram lidas {len(entries) + directories}")
+    return count, unpacked, packed, entries
+
+
+def verify_volume(archive: Path, staging: Path) -> None:
+    count, _unpacked, _packed, entries = list_archive(archive)
+    failures: list[str] = []
+    root = staging.resolve()
+    for name, expected_size in entries:
+        output = staging.joinpath(*PurePosixPath(name).parts)
+        try:
+            resolved = output.resolve(strict=True)
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            failures.append(f"ausente ou fora da pasta de destino: {name}")
+            continue
+        if not resolved.is_file():
+            failures.append(f"não é arquivo: {name}")
+        elif resolved.stat().st_size != expected_size:
+            failures.append(f"tamanho divergente: {name} ({resolved.stat().st_size} != {expected_size})")
+        if len(failures) >= 20:
+            break
+    if failures:
+        raise DodiError(f"validação pós-extração falhou em {archive.name}:\n" + "\n".join(failures))
+    print(f"[OK] {archive.name}: {count} arquivos presentes e com tamanho correto")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_identity(setup: Path, archives: list[Path]) -> dict[str, Any]:
+    return {
+        "setup_sha256": sha256(setup),
+        "archives": {p.name: {"size": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
+                     for p in archives},
+    }
+
+
+def ask_number(prompt: str, low: int, high: int, default: int | None = None) -> int:
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        raw = input(f"{prompt}{suffix}: ").strip()
+        if not raw and default is not None:
+            return default
+        if raw.isdigit() and low <= int(raw) <= high:
+            return int(raw)
+        print(f"Escolha um número entre {low} e {high}.")
+
+
+def choose_source(argument: Path | None) -> Path:
+    if argument is None:
+        for candidate in (Path.cwd(), Path(os.environ.get("DODI_LAUNCHER_DIR", str(ROOT)))):
+            if package_files(candidate):
+                return candidate.resolve()
+    raw = str(argument) if argument is not None else ""
+    if not raw:
+        print(tr("DODI INSTALLER — informe o arquivo do pacote", "DODI INSTALLER — select the repack file"))
+        print(tr("Use Setup.exe, um volume .doi ou a pasta que contém os arquivos.", "Enter Setup.exe, a .doi volume, or the folder containing the package files."))
+        raw = input(tr("Arquivo ou pasta do pacote: ", "Package file or folder: ")).strip()
+    if not raw:
+        raise DodiError("nenhum arquivo ou pasta do pacote foi informado")
+    path = Path(raw).expanduser().resolve()
+    if not path.exists():
+        raise DodiError(f"caminho não existe: {path}")
+    folder = path if path.is_dir() else path.parent
+    if not package_files(folder):
+        raise DodiError(f"não encontrei Setup.exe e volumes dataN.doi junto de: {path}")
+    return folder
+
+
+def choose_destination(title: str) -> Path:
+    roots = [root for root in DATA_MOUNTS if root.is_mount()]
+    roots.sort(key=lambda root: (root != Path("/mnt/Eita"), -shutil.disk_usage(root).free))
+    if not roots:
+        raise DodiError("não encontrei um disco de dados montado; o disco do sistema não será usado")
+    choices = [root / "Games" / title for root in roots]
+    print("\n╭── " + tr("DESTINO DA EXTRAÇÃO", "EXTRACTION DESTINATION") + " ──────────────────────────╮")
+    for index, path in enumerate(choices, 1):
+        print(f"  {index}. {path} — {shutil.disk_usage(path.parent.parent).free / 1024**3:.1f} GiB " + tr("livres", "free") + (" · " + tr("já existe", "already exists") if path.exists() else ""))
+    print(f"{len(choices) + 1}. " + tr("Digitar caminho completo", "Enter a full path"))
+    selected = ask_number(tr("Destino", "Destination"), 1, len(choices) + 1, 1)
+    if selected <= len(choices):
+        return choices[selected - 1].expanduser().resolve()
+    return Path(input(tr("Caminho completo: ", "Full path: ")).strip()).expanduser().resolve()
+
+
+def yes_no(prompt: str, default: bool) -> bool:
+    suffix = "S/n" if default else "s/N"
+    while True:
+        answer = input(f"{prompt} [{suffix}]: ").strip().casefold()
+        if not answer:
+            return default
+        if answer in {"s", "sim", "y", "yes"}:
+            return True
+        if answer in {"n", "não", "nao", "no"}:
+            return False
+
+
+def atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".new")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def wine_environment(prefix: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update({"WINEPREFIX": str(prefix), "WINEDEBUG": "-all", "WINEARCH": "win64"})
+    return env
+
+
+def host_to_wine(path: Path, prefix: Path) -> str:
+    resolved = path.resolve()
+    if str(resolved).startswith("/mnt/"):
+        return "W:" + str(resolved)[4:].replace("/", "\\")
+    winepath = shutil.which("winepath")
+    if not winepath:
+        raise DodiError("winepath não encontrado para converter o caminho do destino")
+    return run_capture([winepath, "-w", str(resolved)], env=wine_environment(prefix)).strip().replace("\n", "")
+
+
+def ensure_wine(prefix: Path, *, codecs_only: bool = False) -> tuple[str, dict[str, str]]:
+    wine_path = PREFERRED_WINE if PREFERRED_WINE.is_file() else Path(shutil.which("wine") or "")
+    if not wine_path.is_file():
+        raise DodiError("Wine não encontrado; instale Wine ou disponibilize a build corrigida")
+    wine = str(wine_path.resolve())
+    env = wine_environment(prefix)
+    if codecs_only:
+        env["WINEDLLOVERRIDES"] = "mscoree,mshtml="
+    env["TMPDIR"] = str(PREFLIGHT_TMP)
+    env["XDG_CACHE_HOME"] = str(prefix.parent / "cache")
+    prefix.mkdir(parents=True, exist_ok=True)
+    if not (prefix / "system.reg").is_file():
+        wineboot_path = wine_path.parent / "wineboot"
+        wineboot = str(wineboot_path) if wineboot_path.is_file() else shutil.which("wineboot")
+        if wineboot:
+            run_capture([wineboot, "-i"], env=env)
+        else:
+            run_capture([wine, "wineboot.exe", "-i"], env=env)
+    return wine, env
+
+
+def map_drive(prefix: Path, letter: str, target: Path) -> None:
+    link = prefix / "dosdevices" / f"{letter.casefold()}:"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        if link.resolve() == target.resolve():
+            return
+        raise DodiError(f"a unidade {letter.upper()}: já aponta para outro caminho: {link.resolve()}")
+    if link.exists():
+        raise DodiError(f"a unidade {letter.upper()}: já existe e não é link simbólico")
+    link.symlink_to(target.resolve())
+
+
+def folder_metrics(folder: Path) -> tuple[int, int]:
+    total = files = 0
+    if not folder.is_dir():
+        return total, files
+    for parent, dirs, names in os.walk(folder, followlinks=False):
+        dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()]
+        for name in names:
+            path = Path(parent) / name
+            try:
+                if path.is_file() and not path.is_symlink():
+                    total += path.stat().st_size
+                    files += 1
+            except OSError:
+                continue
+    return total, files
+
+
+def select_codec_drive(prefix: Path, workdir: Path) -> str:
+    links = prefix / "dosdevices"
+    for letter in "RSTUVWXYZ":
+        link = links / f"{letter.lower()}:"
+        if link.is_symlink() and link.resolve() == workdir.resolve():
+            return f"{letter}:"
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(workdir)
+            return f"{letter}:"
+    raise DodiError("nenhuma letra de unidade livre para o diretório temporário dos codecs")
+
+
+def run_freearc(action: str, archive: Path, staging: Path, workdir: Path,
+                runtime: Path, prefix: Path, wine: str, env: dict[str, str],
+                log_path: Path) -> None:
+    codec_drive = select_codec_drive(prefix, workdir)
+    source_win = host_to_wine(archive, prefix)
+    target_win = host_to_wine(staging, prefix)
+    runtime_win = host_to_wine(runtime, prefix)
+    work_win = f"{codec_drive}\\"
+    command = [wine, str(HELPER), runtime_win + "\\unarc.dll", action, "-o+",
+               "-dp" + target_win, "-w" + work_win,
+               "-cfg" + runtime_win + "\\arc.ini", source_win, "", "", "", ""]
+    print(f"[{action.upper()}] {archive.name}")
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        process = subprocess.Popen(command, cwd=runtime, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, errors="replace",
+                                   bufsize=1)
+        assert process.stdout is not None
+        for line in process.stdout:
+            log.write(line)
+            if line.startswith("[FreeArc] event=") or "error" in line.casefold() or "crc" in line.casefold():
+                print(line.rstrip())
+        code = process.wait()
+        log.flush()
+        os.fsync(log.fileno())
+    final = re.findall(r"\[FreeArc\] final rc=(-?\d+)", log_path.read_text(encoding="utf-8", errors="replace"))
+    if code != 0 or not final or final[-1] != "0":
+        raise DodiError(f"FreeArc {action} falhou em {archive.name} (processo {code}; ver {log_path})")
+
+
+# The plan was recovered from this exact setup's PascalScript bytecode.
+DIRECT_PLANS = {
+    "e1184c8459ecf9e20a4dc87ba3dacf8993ccab8a03fa53856b8a2b50976ea36b": {
+        "required": ["data1.doi", "data2.doi"], "optional": ["Wallpaper.doi"],
+    },
+}
+
+
+def prefix_usage(prefix: Path) -> tuple[float, int, int]:
+    cpu = 0.0
+    read_bytes = write_bytes = 0
+    expected = ("WINEPREFIX=" + str(prefix)).encode()
+    ticks = os.sysconf("SC_CLK_TCK")
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if expected not in (proc / "environ").read_bytes().split(b"\0"):
+                continue
+            raw = (proc / "stat").read_text()
+            fields = raw[raw.rfind(")") + 2:].split()
+            cpu += (int(fields[11]) + int(fields[12])) / ticks
+            io = dict(line.split(": ") for line in (proc / "io").read_text().splitlines())
+            read_bytes += int(io["read_bytes"])
+            write_bytes += int(io["write_bytes"])
+        except (OSError, ValueError, KeyError, IndexError):
+            continue
+    return cpu, read_bytes, write_bytes
+
+
+def run_isdone(archive: Path, staging: Path, workdir: Path, runtime: Path,
+               prefix: Path, wine: str, env: dict[str, str], log_path: Path) -> None:
+    helper = ROOT / "libexec/isdone-helper.exe"
+    command = [wine, str(helper), host_to_wine(runtime / "ISDone.dll", prefix),
+               host_to_wine(archive, prefix), host_to_wine(staging, prefix),
+               host_to_wine(runtime / "arc.ini", prefix), host_to_wine(workdir, prefix)]
+    started = time.monotonic()
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(command, cwd=runtime, env=env, stdout=log,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            with log_path.open(encoding="utf-8", errors="replace") as reader:
+                last_report = started
+                last_usage = prefix_usage(prefix)
+                while True:
+                    for line in reader:
+                        if "[ISDone]" in line:
+                            print(f"  {line.rstrip()}", flush=True)
+                    if process.poll() is not None:
+                        break
+                    now = time.monotonic()
+                    if now - last_report >= 15:
+                        size, files = folder_metrics(staging)
+                        usage = prefix_usage(prefix)
+                        dt = now - last_report
+                        cpu = max(0, usage[0] - last_usage[0]) * 100 / dt
+                        rd = max(0, usage[1] - last_usage[1]) / dt / 1024**2
+                        wr = max(0, usage[2] - last_usage[2]) / dt / 1024**2
+                        elapsed = int(now-started)
+                        minutes, seconds = divmod(elapsed, 60)
+                        print(f"[{archive.name} · {minutes:02d}:{seconds:02d}] "
+                              f"saída {size / 1024**3:.2f} GiB em {files} arquivo(s) | "
+                              f"CPU {cpu / 100:.1f} núcleo(s) | leitura {rd:.1f} MiB/s | "
+                              f"gravação {wr:.1f} MiB/s", flush=True)
+                        last_usage = usage
+                        last_report = now
+                    time.sleep(1)
+            code = process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            server = Path(wine).parent / "wineserver"
+            if server.is_file():
+                subprocess.run([str(server), "-k"], env=env, check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    content = log_path.read_text(encoding="utf-8", errors="replace")
+    if code != 0 or "[ISDone] result=1" not in content:
+        raise DodiError(f"ISDone falhou em {archive.name}; código {code}. Log: {log_path}\n{content[-1500:]}")
+
+
+def install_direct(source: Path, destination: Path, selected: list[Path], *, plan_only: bool = False) -> None:
+    setup, required, optional = package_files(source) or (None, [], [])
+    if setup is None:
+        raise DodiError("estrutura do pacote mudou desde a descoberta")
+    setup_hash = sha256(setup)
+    plan = DIRECT_PLANS.get(setup_hash)
+    if plan is None:
+        raise DodiError("este Setup ainda não tem plano direto auditado; use --gui para a interface original")
+    if [p.name for p in required] != plan["required"] or any(p.name not in plan["optional"] for p in selected):
+        raise DodiError("os volumes não correspondem ao plano auditado")
+    destination = destination.resolve()
+    if destination == source or source in destination.parents or destination in source.parents:
+        raise DodiError("origem e destino não podem conter um ao outro")
+    disk_root = next((root for root in DATA_MOUNTS if root.is_mount()
+                      and root in destination.parents), None)
+    ancestor = next(p for p in [destination, *destination.parents] if p.exists())
+    if disk_root is None or ancestor.stat().st_dev == Path("/").stat().st_dev:
+        raise DodiError("o destino deve ficar em um disco de dados; o NVMe do sistema é bloqueado")
+    archives = required + [p for p in optional if p in selected]
+    identity = source_identity(setup, archives)
+    parent = destination.parent
+    state_dir = parent / f".{destination.name}.dodi-state"
+    staging = parent / f".{destination.name}.dodi-stage"
+    journal = state_dir / "journal.json"
+    if plan_only:
+        print("\nPlano direto: ISDoneInit → ISArcExtract → ISDoneStop, sem abrir Setup.exe")
+        print("Volumes: " + ", ".join(p.name for p in archives))
+        print(f"Destino: {destination}\nTemporários: {staging}\nEstado: {state_dir}")
+        print("Retomada por volume; CRC do extrator e conferência de nomes/tamanhos após cada volume.")
+        return
+    if state_dir.is_symlink() or staging.is_symlink():
+        raise DodiError("estado e pasta temporária não podem ser links simbólicos")
+    if journal.exists():
+        state = json.loads(journal.read_text(encoding="utf-8"))
+        if state.get("identity") != identity or state.get("destination") != str(destination):
+            raise DodiError(f"journal incompatível; preserve-o e escolha outro destino: {journal}")
+        if state.get("status") == "complete":
+            for archive in archives:
+                verify_volume(archive, destination)
+            print(f"Instalação já concluída: {destination}")
+            return
+        if state.get("backend") != "isdone-direct-v1" or not staging.is_dir():
+            raise DodiError("estado anterior pertence a outro backend ou está incompleto; escolha outro destino")
+    else:
+        if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+            raise DodiError(f"destino contém dados: {destination}")
+        if staging.exists() or state_dir.exists():
+            raise DodiError("há temporários sem journal compatível; escolha outro destino")
+        parent.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir()
+        staging.mkdir()
+        state = {"schema": 1, "backend": "isdone-direct-v1", "source": str(source),
+                 "destination": str(destination), "identity": identity, "completed": [],
+                 "status": "prepared", "created": int(time.time())}
+        atomic_json(journal, state)
+    runtime = state_dir / "payload/tmp"
+    workdir = state_dir / "codec-work"
+    prefix = state_dir / "wine-prefix"
+    try:
+        if not (runtime / "ISDone.dll").is_file():
+            run_capture([str(INNO), "-e", "-s", "-d", str(runtime.parent), str(setup)])
+        workdir.mkdir(exist_ok=True)
+        wine, env = ensure_wine(prefix, codecs_only=True)
+        map_drive(prefix, "W", Path("/mnt"))
+        env["TMPDIR"] = str(workdir)
+        done = set(state.get("completed", []))
+        state["status"] = "running"
+        atomic_json(journal, state)
+        for archive in archives:
+            if archive.name not in done:
+                print(f"\nExtraindo {archive.name} pelo terminal...", flush=True)
+                run_isdone(archive, staging, workdir, runtime, prefix, wine, env,
+                           state_dir / (archive.name + ".extract.log"))
+            verify_volume(archive, staging)
+            done.add(archive.name)
+            state["completed"] = sorted(done)
+            atomic_json(journal, state)
+        if destination.exists():
+            destination.rmdir()  # only an empty directory is permitted
+        os.replace(staging, destination)
+        state.update(status="complete", completed_at=int(time.time()))
+        atomic_json(journal, state)
+        print(f"\nExtração concluída e validada: {destination}\nJournal e logs: {state_dir}")
+    except (KeyboardInterrupt, Exception) as exc:
+        state["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        state["error"] = str(exc)
+        atomic_json(journal, state)
+        if isinstance(exc, KeyboardInterrupt):
+            raise DodiError("interrompido; volumes concluídos e arquivos temporários foram preservados") from exc
+        raise
+    finally:
+        server = PREFERRED_WINE.parent / "wineserver"
+        if prefix.is_dir() and server.is_file():
+            subprocess.run([str(server), "-k"], env=wine_environment(prefix), check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+
+
+def install(source: Path, destination: Path, selected: list[Path], *,
+            plan_only: bool = False, cli_mode: bool = False) -> None:
+    """Run DODI's own Inno/ISDone pipeline in an isolated Wine prefix."""
+    package = package_files(source)
+    if not package:
+        raise DodiError("estrutura do pacote mudou desde a descoberta")
+    setup, required, optional = package
+    archives = required + [item for item in optional if item in selected]
+    identity = source_identity(setup, archives)
+    parent = destination.parent
+    state_dir = parent / f".{destination.name}.dodi-state"
+    journal = state_dir / "journal.json"
+    log_path = state_dir / ("setup-cli-wine.log" if cli_mode else "setup-wine.log")
+    prefix = state_dir / "wine-prefix"
+
+    if destination == source or source in destination.parents or destination in source.parents:
+        raise DodiError("origem e destino não podem conter um ao outro")
+    disk_root = next((root for root in DATA_MOUNTS
+                      if root.is_mount() and destination != root and root in destination.parents), None)
+    if disk_root is None:
+        raise DodiError("o destino precisa estar dentro de um disco de dados montado em /mnt; o NVMe do sistema é bloqueado")
+    if plan_only:
+        wine_path = PREFERRED_WINE if PREFERRED_WINE.is_file() else Path(shutil.which("wine") or "wine")
+        print("\nPlano de instalação")
+        print(f"  Build Wine: {wine_path}")
+        print(f"  Prefixo isolado: {prefix}")
+        print(f"  Origem R: {source}")
+        print(f"  Destino D: {parent}")
+        print(f"  Pasta final: {destination}")
+        if cli_mode:
+            print("  Aviso: este modo silencioso é experimental e não concluiu a validação neste pacote.")
+            print(f"  Comando: R:\\{setup.name} /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=D:\\{destination.name}")
+            print(f"  Log: D:\\.{destination.name}.dodi-state\\dodi-setup.log")
+            print("  Modo: terminal; componentes padrão do Setup DODI")
+        else:
+            print(f"  Comando: R:\\{setup.name} /DIR=D:\\{destination.name}")
+            print("  Modo: interface original do Setup DODI")
+        print("  Pipeline: Setup DODI original, incluindo ISDone/FreeArc e codecs do pacote")
+        print("  Nenhum prefixo, journal ou arquivo de jogo será criado neste modo.")
+        return
+
+    parent.mkdir(parents=True, exist_ok=True)
+
+    if journal.exists():
+        state = json.loads(journal.read_text(encoding="utf-8"))
+        if state.get("identity") != identity or state.get("destination") != str(destination):
+            raise DodiError(f"há um journal incompatível em {journal}; escolha outro destino")
+        if state.get("status") == "complete":
+            print(f"Esta instalação já foi concluída em {destination}.")
+            return
+        if destination.exists() and not destination.is_dir():
+            raise DodiError(f"o destino existente não é uma pasta: {destination}")
+        print("Foi encontrada uma execução anterior. O Setup DODI será reaberto no mesmo destino;")
+        print("a interface original decide como lidar com os arquivos já presentes.")
+    else:
+        if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+            raise DodiError(f"o destino já contém dados e não tem journal deste projeto: {destination}")
+        state_dir.mkdir(parents=True, exist_ok=True)
+        atomic_json(journal, {"schema": 1, "source": str(source), "destination": str(destination),
+                              "identity": identity, "volumes": [p.name for p in archives],
+                              "status": "prepared", "created": int(time.time())})
+
+    wine, env = ensure_wine(prefix)
+    env["TMPDIR"] = str(state_dir / "tmp")
+    env["XDG_CACHE_HOME"] = str(state_dir / "cache")
+    (state_dir / "tmp").mkdir(parents=True, exist_ok=True)
+    map_drive(prefix, "R", source)
+    map_drive(prefix, "D", parent)
+    command = [wine, f"R:\\{setup.name}"]
+    if cli_mode:
+        command.extend(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
+        command.append(f"/LOG=D:\\.{destination.name}.dodi-state\\dodi-setup.log")
+    command.append(f"/DIR=D:\\{destination.name}")
+
+    state = json.loads(journal.read_text(encoding="utf-8"))
+    state["status"] = "running"
+    state["wine"] = run_capture([wine, "--version"], env=env).strip()
+    state["command"] = command
+    atomic_json(journal, state)
+
+    if cli_mode:
+        print("\nInstalando pelo terminal com o Setup DODI em modo silencioso.")
+        print("O Setup usará os componentes padrão configurados neste pacote.")
+        print(f"Destino: D:\\{destination.name}")
+    else:
+        print("\nA interface do Setup DODI vai abrir no desktop.")
+        print(f"Escolha os componentes na interface; o destino já está definido como D:\\{destination.name}.")
+    print(f"Todos os arquivos temporários e do jogo ficam em {disk_root}.")
+    print(f"Logs: {log_path}")
+    start_size, start_files = folder_metrics(destination)
+    started = time.monotonic()
+    last_report = started
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        log.write("\nCOMMAND: " + repr(command) + "\n")
+        log.flush()
+        process = subprocess.Popen(command, cwd=source, env=env, stdout=log,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            while process.poll() is None:
+                time.sleep(5)
+                now = time.monotonic()
+                if now - last_report >= 15:
+                    size, files = folder_metrics(destination)
+                    delta = max(0, size - start_size)
+                    elapsed = int(now - started)
+                    print(f"[{elapsed // 60:02d}:{elapsed % 60:02d}] {size:,} bytes em {files} arquivos; crescimento nesta execução: {delta:,} bytes")
+                    last_report = now
+            return_code = process.wait()
+            log.flush()
+            os.fsync(log.fileno())
+        except KeyboardInterrupt:
+            process.terminate()
+            server = Path(wine).parent / "wineserver"
+            if server.is_file():
+                subprocess.run([str(server), "-k"], env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+            process.wait()
+            state = json.loads(journal.read_text(encoding="utf-8"))
+            state["status"] = "interrupted"
+            state["interrupted_at"] = int(time.time())
+            atomic_json(journal, state)
+            raise DodiError("instalação interrompida; arquivos e journal foram preservados no disco de dados")
+
+    final_size, final_files = folder_metrics(destination)
+    state = json.loads(journal.read_text(encoding="utf-8"))
+    state["exit_code"] = return_code
+    state["output_bytes"] = final_size
+    state["output_files"] = final_files
+    state["finished_at"] = int(time.time())
+    if return_code != 0 or final_files == 0:
+        state["status"] = "failed"
+        atomic_json(journal, state)
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+        raise DodiError(f"Setup DODI terminou com código {return_code}; saída {final_size:,} bytes/{final_files} arquivos. Consulte {log_path}\n{tail}")
+
+    print("\nO Setup DODI terminou. Verificando os arquivos dos volumes principais...")
+    try:
+        for archive in required:
+            verify_volume(archive, destination)
+    except DodiError:
+        state["status"] = "verification_failed"
+        atomic_json(journal, state)
+        raise
+    state["status"] = "complete"
+    atomic_json(journal, state)
+    print(f"Instalação validada: {final_size:,} bytes em {final_files} arquivos.")
+    print(f"Destino: {destination}\nJournal e logs: {state_dir}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Instalador terminal para pacotes locais DODI")
+    parser.add_argument("source", nargs="?", type=Path,
+                        help="Setup.exe, arquivo .doi ou pasta do pacote (sem varredura automática)")
+    parser.add_argument("--scan", action="store_true", help="apenas localizar e analisar pacotes conhecidos")
+    parser.add_argument("--plan", action="store_true", help="analisar pacote e mostrar o plano sem iniciar a instalação")
+    parser.add_argument("--cli", action="store_true", help="extração direta pelo terminal (padrão)")
+    parser.add_argument("--gui", action="store_true", help="abrir a interface original do Setup")
+    parser.add_argument("--destination", type=Path, help="destino em disco de dados")
+    parser.add_argument("--optional", choices=["all", "none"], help="seleção de opcionais sem perguntar")
+    parser.add_argument("--yes", action="store_true", help="confirmar a extração após as verificações")
+    args = parser.parse_args()
+    try:
+        choose_language()
+        if args.scan:
+            candidates = [folder for root in DEFAULT_SCAN_ROOTS for folder in discover(root)]
+            print("Pacotes DODI com Setup.exe e dataN.doi:")
+            for folder in candidates:
+                setup, required, optional = package_files(folder) or (None, [], [])
+                print(f"\n{folder}\n  Setup: {setup.name}; volumes principais: {len(required)}; opcionais: {len(optional)}")
+                for archive in required + optional:
+                    files, unpacked, packed, _names = list_archive(archive)
+                    print(f"  {archive.name}: {files} arquivos; {unpacked:,} descompactados; {packed:,} compactados")
+            return 0
+
+        if args.cli and args.gui:
+            raise DodiError("escolha --cli ou --gui")
+        source = choose_source(args.source)
+        setup, required, optional = package_files(source) or (None, [], [])
+        assert setup is not None
+        title = source.name
+        info = run_capture([str(INNO), "--info", str(setup)])
+        title_match = re.search(r'^Inspecting "(.+?)" - setup data', info, re.M)
+        if title_match:
+            title = title_match.group(1).strip()
+        print(f"\nDODI INSTALLER — {title}")
+        print(tr("O Setup.exe e os volumes serão conferidos; a extração usará ISDone via Wine.", "Setup.exe and the volumes will be checked; extraction uses the package's ISDone components through Wine."))
+        print(tr("Volumes principais:", "Required volumes:"))
+        selected: list[Path] = []
+        summaries: dict[str, tuple[int, int, int, list[tuple[str, int]]]] = {}
+        for archive in required:
+            summary = list_archive(archive)
+            summaries[archive.name] = summary
+            print(f"  {archive.name}: {summary[0]} arquivos; {summary[1]:,} bytes")
+        if optional:
+            print("\n" + tr("Conteúdo opcional:", "Optional content:"))
+            for index, archive in enumerate(optional, 1):
+                summary = list_archive(archive)
+                summaries[archive.name] = summary
+                print(f"  {index}. {archive.name}: {summary[0]} arquivos; {summary[1]:,} bytes")
+                if not args.gui and (args.optional == "all" or
+                    (args.optional is None and yes_no(tr(f"Incluir {archive.name}?", f"Include {archive.name}?"), True))):
+                    selected.append(archive)
+            if args.gui:
+                print("  Escolha os opcionais na interface do Setup.")
+        destination = args.destination.expanduser().resolve() if args.destination else choose_destination(title)
+        total_bytes = sum(summaries[p.name][1] for p in required + (optional if args.gui else selected))
+        disk_root = next((root for root in DATA_MOUNTS
+                          if root.is_mount() and (destination == root or root in destination.parents)), None)
+        if disk_root is None:
+            raise DodiError("escolha um caminho dentro de um disco de dados montado em /mnt; o NVMe do sistema não é usado")
+        free_bytes = shutil.disk_usage(disk_root).free
+        print(f"\n{tr('Espaço estimado para os volumes selecionados', 'Estimated space for selected volumes')}: {total_bytes:,} bytes")
+        print(f"{tr('Espaço livre no destino', 'Free space on destination')}: {free_bytes:,} bytes")
+        if free_bytes < total_bytes + max(2 * 1024**3, total_bytes // 20):
+            raise DodiError("espaço livre insuficiente, incluindo margem de segurança")
+        print("\n" + tr("Verificando os dados embutidos do Setup.exe...", "Checking data embedded in Setup.exe..."))
+        run_capture([str(INNO), "-t", str(setup)])
+        print(tr("A tabela de conteúdo de cada volume foi lida com sucesso.", "Volume file lists were read successfully."))
+        confirm = "Confirmar abertura do Setup DODI?" if args.gui else "Confirmar extração pelo terminal?"
+        if not args.plan and not args.yes and not yes_no(confirm, True):
+            print("Operação cancelada sem criar a pasta de destino.")
+            return 0
+        if args.gui:
+            install(source, destination, [], plan_only=args.plan)
+        else:
+            install_direct(source, destination, selected, plan_only=args.plan)
+        return 0
+    except (DodiError, OSError, ValueError, json.JSONDecodeError, KeyboardInterrupt, EOFError) as error:
+        print(f"\n[ERRO] {error}", file=sys.stderr)
+        return 2
+
+
+def interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGHUP, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    raise SystemExit(main())
