@@ -22,9 +22,22 @@ INNO = ROOT / "libexec" / "innoextract"
 UNARC = ROOT / "libexec" / "unarc"
 HELPER = ROOT / "libexec" / "unarc-helper.exe"
 DEFAULT_SCAN_ROOTS = [Path("/mnt/Eita/Torrent/Games")]
-DATA_MOUNTS = [Path("/mnt/Eita"), Path("/mnt/HD_ARQUIVOS"),
-               Path("/mnt/Exclusivo OBS"), Path("/mnt/fodase"), Path("/mnt/SSD")]
-PREFLIGHT_TMP = Path("/mnt/Eita/.work/dodi-installer/tmp")
+DEFAULT_DATA_MOUNTS = [Path("/mnt/Eita"), Path("/mnt/HD_ARQUIVOS"),
+                       Path("/mnt/Exclusivo OBS"), Path("/mnt/fodase"), Path("/mnt/SSD")]
+_runtime_mount = os.environ.get("DODI_RUNTIME_MOUNT")
+if _runtime_mount:
+    runtime_mount_path = Path(_runtime_mount).expanduser()
+    if runtime_mount_path not in DEFAULT_DATA_MOUNTS:
+        DEFAULT_DATA_MOUNTS.append(runtime_mount_path)
+DATA_MOUNTS = [Path(item).expanduser() for item in
+               os.environ.get("DODI_DATA_MOUNTS", os.pathsep.join(map(str, DEFAULT_DATA_MOUNTS))).split(os.pathsep)
+               if item]
+if not DATA_MOUNTS:
+    DATA_MOUNTS = DEFAULT_DATA_MOUNTS
+_preflight_root = next((root for root in DATA_MOUNTS if root.is_mount()), DATA_MOUNTS[0])
+PREFLIGHT_TMP = Path(os.environ.get(
+    "DODI_PREFLIGHT_TMP", str(_preflight_root / ".work/dodi-installer/tmp")
+)).expanduser()
 PREFERRED_WINE = ROOT / "libexec/wine-11.14-fitgirl-amd64/bin/wine"
 if not PREFERRED_WINE.is_file():
     PREFERRED_WINE = Path("/mnt/Eita/Tools/fitgirl-wine/wine-11.14-fitgirl-amd64/bin/wine")
@@ -90,8 +103,9 @@ def discover(root: Path) -> list[Path]:
 
 
 def run_capture(command: list[str], *, env: dict[str, str] | None = None) -> str:
-    if not Path("/mnt/Eita").is_mount():
-        raise DodiError("o volume Eita não está montado; temporários de análise não serão gravados no disco do sistema")
+    if not any(root.is_mount() for root in DATA_MOUNTS):
+        raise DodiError(tr("nenhum disco de dados configurado está montado; temporários não serão gravados no disco do sistema",
+                           "none of the configured data disks is mounted; temporary files will not be written to the system disk"))
     PREFLIGHT_TMP.mkdir(parents=True, exist_ok=True)
     actual_env = (env or os.environ).copy()
     actual_env["TMPDIR"] = str(PREFLIGHT_TMP)
@@ -199,7 +213,8 @@ def choose_source(argument: Path | None) -> Path:
 
 def choose_destination(title: str) -> Path:
     roots = [root for root in DATA_MOUNTS if root.is_mount()]
-    roots.sort(key=lambda root: (root != Path("/mnt/Eita"), -shutil.disk_usage(root).free))
+    preferred_root = DATA_MOUNTS[0] if DATA_MOUNTS else None
+    roots.sort(key=lambda root: (root != preferred_root, -shutil.disk_usage(root).free))
     if not roots:
         raise DodiError("não encontrei um disco de dados montado; o disco do sistema não será usado")
     choices = [root / "Games" / title for root in roots]
@@ -238,6 +253,8 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
 def wine_environment(prefix: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update({"WINEPREFIX": str(prefix), "WINEDEBUG": "-all", "WINEARCH": "win64"})
+    if PREFERRED_WINE.is_file():
+        env["PATH"] = str(PREFERRED_WINE.parent) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -245,7 +262,8 @@ def host_to_wine(path: Path, prefix: Path) -> str:
     resolved = path.resolve()
     if str(resolved).startswith("/mnt/"):
         return "W:" + str(resolved)[4:].replace("/", "\\")
-    winepath = shutil.which("winepath")
+    bundled_winepath = PREFERRED_WINE.parent / "winepath"
+    winepath = shutil.which("winepath") or (str(bundled_winepath) if bundled_winepath.is_file() else None)
     if not winepath:
         raise DodiError("winepath não encontrado para converter o caminho do destino")
     return run_capture([winepath, "-w", str(resolved)], env=wine_environment(prefix)).strip().replace("\n", "")

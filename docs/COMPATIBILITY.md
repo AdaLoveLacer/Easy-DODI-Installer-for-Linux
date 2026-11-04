@@ -7,7 +7,7 @@ This document records the supported runtime boundary for the standalone CLI and 
 - Linux x86-64 only. The standalone contains x86-64 ELF tools and an x86-64 Wine runtime.
 - Python 3 must be available to launch the standalone. The tested launch path uses Python 3.11 or newer; older Python versions have not been validated.
 - The host must provide compatible glibc and libstdc++ versions for the bundled native tools. The current package needs at least `GLIBC_2.38` and `GLIBCXX_3.4.32` among the inspected symbol versions.
-- The runtime is prepared under `/mnt/SSD/Tools/dodi-cli`. The tested default package flow also expects `/mnt/Eita` for temporary and preflight paths. Both mounts need executable permissions for unpacked tools; a `noexec` mount prevents them from starting.
+- By default, the runtime is prepared under `/mnt/SSD/Tools/dodi-cli`. Set `DODI_RUNTIME_ROOT` and, if needed, `DODI_RUNTIME_MOUNT` to use another mounted data disk. `DODI_DATA_MOUNTS` controls the mounted roots allowed for output; the runtime disk is included by default. `DODI_PREFLIGHT_TMP` can select the analysis temporary directory. Data mounts need executable permissions for unpacked tools; a `noexec` mount prevents them from starting.
 - Compatibility of direct extraction is package-specific. The audited direct plan currently applies only to the exact Resident Evil 2 Setup hash documented in [PLAN_RE2.md](PLAN_RE2.md).
 
 ## Results so far
@@ -15,6 +15,7 @@ This document records the supported runtime boundary for the standalone CLI and 
 | Environment | Result | What was checked |
 | --- | --- | --- |
 | CachyOS rolling, x86-64, glibc 2.44, Python 3.14 | Pass on host | Native tools inspected; full package flow was validated separately on this computer. |
+| Linux Mint 22.3 Cinnamon live VM, 6 vCPUs, 4 GiB RAM | Full extraction passed with a temporary mount adapter; rebuilt standalone passed fresh-launch smoke check | ISDone completed all three volumes; final output had 87 files and 26,087,258,415 bytes. The test ISO predated the current standalone bundle, so the VM copy also received the five Boost shared libraries from the current artifact. The rebuilt standalone then bootstrapped its runtime on the separate data disk, displayed the language menu, validated the embedded content table, and printed the `--plan` output without starting another extraction. |
 | Debian 13, `python:3.12-slim-trixie`, glibc 2.41 | Pass in Docker | Standalone launched, parsed package volumes, checked embedded content table, and printed the direct extraction plan. No extraction was started in this container test. |
 | Ubuntu 24.04, glibc 2.39 | Pass in Docker | Same `--plan` checks as Debian 13. No extraction was started in this container test. |
 | Debian 12, `python:3.11-slim-bookworm`, glibc 2.36 | Fail | Initial probe reported missing `GLIBCXX_3.4.32` and `GLIBC_2.38`; the current launcher now detects and reports these before unpacking Wine. |

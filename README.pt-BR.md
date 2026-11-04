@@ -16,7 +16,17 @@ O menu pergunta o idioma e depois apresenta as opções do pacote. Também é po
 ./dodi /caminho/para/Setup.exe
 ```
 
-O standalone inclui as ferramentas de extração e o runtime do Wine. Na primeira execução, prepara o runtime em `/mnt/SSD/Tools/dodi-cli`; mantenha essa pasta. Requer Linux x86-64, Python 3.11 ou mais recente e bibliotecas de sistema compatíveis. Antes de preparar o runtime, o launcher verifica esses requisitos, a montagem do SSD e o espaço disponível. O runtime está incluído, mas o programa não é um binário estático.
+O standalone inclui as ferramentas de extração e o runtime do Wine. Na primeira execução, prepara o runtime em `/mnt/SSD/Tools/dodi-cli`; mantenha essa pasta. Requer Linux x86-64, Python 3.11 ou mais recente e bibliotecas de sistema compatíveis. Antes de preparar o runtime, o launcher verifica esses requisitos, a montagem do disco de dados e o espaço disponível. O runtime está incluído, mas o programa não é um binário estático.
+
+Para usar outro ponto de montagem, defina `DODI_RUNTIME_ROOT` como uma pasta nesse disco. `DODI_RUNTIME_MOUNT` pode indicar explicitamente o sistema de arquivos montado. `DODI_DATA_MOUNTS` é uma lista separada por dois-pontos com as raízes de dados permitidas para a extração; o padrão inclui os discos configurados em `/mnt` e o disco do runtime. `DODI_PREFLIGHT_TMP` permite escolher a pasta temporária de análise. Mantenha esses caminhos em discos de dados, fora do sistema operacional.
+
+Exemplo para um disco removível montado em `/media/alex/Games`:
+
+```sh
+DODI_RUNTIME_ROOT=/media/alex/Games/Tools/dodi-cli \
+DODI_RUNTIME_MOUNT=/media/alex/Games \
+./dodi /caminho/para/Setup.exe
+```
 
 O CLI padrão extrai os volumes selecionados sem executar a interface gráfica original do Setup. Depois de cada volume, confere caminhos e tamanhos dos arquivos, registra o progresso para permitir retomada e só publica a pasta final depois da validação. `--gui` abre o Setup original; `--scan` procura pacotes somente quando solicitado.
 

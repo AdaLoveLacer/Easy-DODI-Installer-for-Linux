@@ -16,7 +16,17 @@ The menu asks which language to use, then offers the package options. You can al
 ./dodi /path/to/Setup.exe
 ```
 
-The standalone includes the extraction tools and Wine runtime. On first launch, it prepares the runtime under `/mnt/SSD/Tools/dodi-cli`; keep that folder. It requires Linux x86-64, Python 3.11 or newer, and compatible system libraries. The launcher checks these requirements, the SSD mount, and available space before preparing the runtime. The runtime is bundled, but the program is not a static binary.
+The standalone includes the extraction tools and Wine runtime. On first launch, it prepares the runtime under `/mnt/SSD/Tools/dodi-cli`; keep that folder. It requires Linux x86-64, Python 3.11 or newer, and compatible system libraries. The launcher checks these requirements, the data mount, and available space before preparing the runtime. The runtime is bundled, but the program is not a static binary.
+
+For another data mount, set `DODI_RUNTIME_ROOT` to a directory on that drive. `DODI_RUNTIME_MOUNT` can name the mounted filesystem explicitly. `DODI_DATA_MOUNTS` is a colon-separated list of mounted data roots allowed for extracted output; it defaults to the configured `/mnt` data disks plus the runtime disk. `DODI_PREFLIGHT_TMP` optionally overrides the analysis temporary directory. Keep these paths on data disks, not the system filesystem.
+
+Example for a removable data drive mounted at `/media/alex/Games`:
+
+```sh
+DODI_RUNTIME_ROOT=/media/alex/Games/Tools/dodi-cli \
+DODI_RUNTIME_MOUNT=/media/alex/Games \
+./dodi /path/to/Setup.exe
+```
 
 The default CLI extracts the package's selected volumes without running the original graphical Setup. It validates extracted paths and file sizes after each volume, records progress for resuming, and publishes the final folder after validation. `--gui` opens the original Setup instead; `--scan` searches for packages only when requested.
 

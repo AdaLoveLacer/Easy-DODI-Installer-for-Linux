@@ -30,12 +30,12 @@ if sys.version_info < (3,11):
  sys.exit('Python 3.11 ou mais recente é necessário; versão encontrada: '+sys.version.split()[0])
 if platform.machine().lower() not in ('x86_64','amd64'):
  sys.exit('Este standalone requer Linux x86-64; arquitetura encontrada: '+platform.machine())
-base=Path('/mnt/SSD/Tools/dodi-cli')
-ssd=Path('/mnt/SSD')
+base=Path(os.environ.get('DODI_RUNTIME_ROOT','/mnt/SSD/Tools/dodi-cli')).expanduser()
+ssd=Path(os.environ.get('DODI_RUNTIME_MOUNT',str(base.parent.parent))).expanduser()
 if not ssd.is_mount():
- sys.exit('Monte o SSD de dados em /mnt/SSD para preparar o runtime.')
+ sys.exit('Monte o disco de dados em '+str(ssd)+' para preparar o runtime.')
 if os.statvfs(ssd).f_flag & os.ST_NOEXEC:
- sys.exit('O SSD em /mnt/SSD está montado com noexec; o runtime precisa executar ferramentas.')
+ sys.exit('O disco de dados em '+str(ssd)+' está montado com noexec; o runtime precisa executar ferramentas.')
 minimum_free_bytes=MINIMUM_FREE_BYTES
 base.mkdir(parents=True,exist_ok=True)
 (base/'NAO_APAGAR.txt').write_text('Runtime do instalador DODI CLI. Necessário para executar o arquivo standalone.\\n')
@@ -45,8 +45,8 @@ with (base/'runtime.lock').open('w') as lock:
  if not (runtime/'ready').exists():
   free_bytes=shutil.disk_usage(ssd).free
   if free_bytes < minimum_free_bytes:
-   sys.exit('Espaço insuficiente em /mnt/SSD para preparar o runtime: são necessários pelo menos '+str(minimum_free_bytes)+' bytes; disponíveis: '+str(free_bytes)+'.')
-  print('Preparando os componentes do DODI CLI no SSD...',flush=True)
+   sys.exit('Espaço insuficiente em '+str(ssd)+' para preparar o runtime: são necessários pelo menos '+str(minimum_free_bytes)+' bytes; disponíveis: '+str(free_bytes)+'.')
+  print('Preparando os componentes do DODI CLI em '+str(ssd)+'...',flush=True)
   stage=Path(tempfile.mkdtemp(prefix='.prepare-',dir=base))
   try:
    data=self.read_bytes().split(b'\\n__DODI_PAYLOAD__\\n',1)[1]
@@ -67,6 +67,7 @@ with (base/'runtime.lock').open('w') as lock:
    shutil.rmtree(stage)
    raise
 os.environ['DODI_LAUNCHER_DIR']=str(self.parent)
+os.environ.setdefault('DODI_RUNTIME_MOUNT',str(ssd))
 os.environ['LD_LIBRARY_PATH']=str(runtime/'libexec')+':'+os.environ.get('LD_LIBRARY_PATH','')
 os.execv(sys.executable,[sys.executable,'-u',str(runtime/'dodi'),*sys.argv[1:]])
 '''.replace('TAG',tag)
