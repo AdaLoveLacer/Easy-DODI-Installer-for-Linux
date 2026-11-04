@@ -28,4 +28,4 @@ A extração direta foi auditada para o pacote Resident Evil 2 usado no desenvol
 
 Execute `python3 tools/build-standalone.py` para gerar `dist/dodi`. Atualmente, o processo espera encontrar o arquivo Wine em `/mnt/Eita/Tools/fitgirl-wine/wine-11.14-fitgirl-amd64.tar.xz`.
 
-A licença do projeto ainda não foi declarada. O standalone inclui componentes de terceiros com termos de licença próprios.
+A licença não comercial do projeto cobre apenas o código original. Os componentes de terceiros mantêm seus próprios termos; consulte [LICENSE](LICENSE) e [avisos de terceiros](THIRD_PARTY_NOTICES.md).

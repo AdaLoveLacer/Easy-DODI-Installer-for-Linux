@@ -4,7 +4,7 @@ import tarfile,io,hashlib,subprocess,re
 root=Path(__file__).resolve().parents[1]
 buf=io.BytesIO()
 with tarfile.open(fileobj=buf,mode='w:gz') as t:
- for name in ['dodi','libexec/innoextract','libexec/unarc','libexec/isdone-helper.exe']:
+ for name in ['dodi','LICENSE','THIRD_PARTY_NOTICES.md','libexec/innoextract','libexec/unarc','libexec/isdone-helper.exe']:
   t.add(root/name,arcname=name)
  libs=set()
  for binary in ['innoextract','unarc']:
